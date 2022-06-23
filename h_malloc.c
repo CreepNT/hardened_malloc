@@ -23,6 +23,46 @@
 #include <sys/mman.h>
 #endif
 
+#if MTE_HEAP_TAGGING
+//From Linux headers file include/uapi/linux/prctl.h
+#define PR_SET_TAGGED_ADDR_CTRL 55
+#define PR_TAGGED_ADDR_ENABLE  (1UL << 0)
+#define PR_MTE_TCF_SHIFT 1
+#define PR_MTE_TCF_SYNC        (1UL << PR_MTE_TCF_SHIFT)
+#define PR_MTE_TAG_SHIFT       3
+
+#define MTELIB_NO_TAG_CHECKS 1 //All tags we use are known to be valid
+#include "third_party/mtelib.h"
+
+static_assert(!SLAB_CANARY, "Canaries cannot be used with MTE");
+
+#define FREE_AREA_TAG MAX_TAG
+
+#if TIGHTLY_PACK_TAG_ARRAY
+    /*
+     * Pack two 4-bit tags per entry of an array of 8-bit elements
+     * 
+     * For even integer X, tags X and X+1 go into array[X/2].
+     * The top byte (0xF0) holds tag X, the bottom byte (0x0F) holds the bottom bit.
+     * Those routines should avoid branching, but maybe the compiler would be more efficient
+     * if we use a naive ternary instead...
+     * 
+     * Since we have to do bit math, this should be slower than using the u8 directly, but saves 64 bytes/slab.
+     */
+#define GET_TAG_FOR_SLOT(slots, slot) ((slots[(slot)/2] >> (4 * !((slot)%2))) & 0xF)
+#define SET_TAG_FOR_SLOT(slots, slot, tag) slots[(slot)/2] = ((slots[(slot)/2] & (0xF << (slot%2))) | tag)
+
+#else
+
+#define GET_TAG_FOR_SLOT(slots, slot)  slots[(slot)]
+#define SET_TAG_FOR_SLOT(slots, slot, tag)  slots[(slot)] = tag
+
+#endif
+
+#else
+static_assert(!TIGHTLY_PACK_TAG_ARRAY, "Tight tag array packing is only supported if MTE is enabled")
+#endif
+
 #define SLAB_QUARANTINE (SLAB_QUARANTINE_RANDOM_LENGTH > 0 || SLAB_QUARANTINE_QUEUE_LENGTH > 0)
 #define REGION_QUARANTINE (REGION_QUARANTINE_RANDOM_LENGTH > 0 || REGION_QUARANTINE_QUEUE_LENGTH > 0)
 #define MREMAP_MOVE_THRESHOLD ((size_t)32 * 1024 * 1024)
@@ -98,6 +138,17 @@ struct slab_metadata {
 #endif
 #if SLAB_QUARANTINE
     u64 quarantine_bitmap[4];
+#endif
+#if MTE_HEAP_TAGGING
+    #if TIGHTLY_PACK_TAG_ARRAY
+    //Each bit of the bitmap holds one allocation and each allocation eats 4 bits.
+    #define NUM_SLOT_TAGS (4 * (sizeof(u64) * 8))
+    #else
+    //Each bit of the bitmap holds one allocation and each allocation eats 8 bits.
+    #define NUM_SLOT_TAGS (4 * (sizeof(u64) * 8))
+    #endif
+
+    u8 slot_tags[NUM_SLOT_TAGS];
 #endif
 };
 
@@ -305,6 +356,14 @@ static struct slab_metadata *alloc_metadata(struct size_class *c, size_t slab_si
     }
 
     struct slab_metadata *metadata = c->slab_info + c->metadata_count;
+
+#if MTE_HEAP_TAGGING
+    for (unsigned i = 0; i < NUM_SLOT_TAGS; i++) {
+        metadata->slot_tags[i] = (FREE_AREA_TAG << 4) | FREE_AREA_TAG;
+    }
+    //!TODO: tag slab memory with FREE_AREA_TAG
+#endif
+
     void *slab = get_slab(c, slab_size, metadata);
     if (non_zero_size && memory_protect_rw(slab, slab_size)) {
         return NULL;
@@ -537,6 +596,12 @@ static inline void *allocate_small(unsigned arena, size_t requested_size) {
             }
             stats_small_allocate(c, size);
 
+#if MTE_HEAP_TAGGING
+            p = pointerSetRandomTag(p, 0); //Empty slab, all slots are free so no exclusions
+            metadata->slot_tags[slot / 2] = pointerGetTag(p) << (4 * (slot % 2));
+            memoryTag(p, info.size);
+#endif
+
             mutex_unlock(&c->lock);
             return p;
         }
@@ -570,6 +635,32 @@ static inline void *allocate_small(unsigned arena, size_t requested_size) {
             stats_slab_allocate(c, slab_size);
             stats_small_allocate(c, size);
 
+#if MTE_HEAP_TAGGING
+            if (GET_TAG_FOR_SLOT(metadata->slot_tags, slot) == FREE_AREA_TAG) { //Slot has never been used - pick a random tag
+                ExcludeMask excludedTags = 0;
+                if (slot > 0) { //Exclude active tag of slot before us, if we're not the first
+                    excludedTags = excludeMaskAddTag(excludedTags, GET_TAG_FOR_SLOT(metadata->slot_tags, slot-1));
+                }
+                if (slot < (NUM_SLOT_TAGS - 1)) { //Exclude active tag of slot after us, if we're not last 
+                    excludedTags = excludeMaskAddTag(excludedTags, GET_TAG_FOR_SLOT(metadata->slot_tags, slot+1));
+                }
+
+                p = pointerSetRandomTag(p, excludedTags);
+            } else {
+                //!TODO: could ADDG be used here?
+                uint8_t tag = GET_TAG_FOR_SLOT(metadata->slot_tags, slot);
+                uint8_t prev_slot_tag = (slot > 0) ? GET_TAG_FOR_SLOT(metadata->slot_tags, slot-1) : FREE_AREA_TAG;
+                uint8_t next_slot_tag = (slot < (NUM_SLOT_TAGS - 1)) ? GET_TAG_FOR_SLOT(metadata->slot_tags, slot+1) : FREE_AREA_TAG;
+
+                do {
+                    tag = (tag + 1) % MAX_TAG;
+                } while (tag == FREE_AREA_TAG || tag == prev_slot_tag || tag == next_slot_tag);
+                p = pointerSetTag(p, tag);
+            }
+            
+            SET_TAG_FOR_SLOT(metadata->slot_tags, slot, pointerGetTag(p));
+#endif
+
             mutex_unlock(&c->lock);
             return p;
         }
@@ -591,6 +682,32 @@ static inline void *allocate_small(unsigned arena, size_t requested_size) {
         }
         stats_slab_allocate(c, slab_size);
         stats_small_allocate(c, size);
+
+#if MTE_HEAP_TAGGING
+        if (GET_TAG_FOR_SLOT(metadata->slot_tags, slot) == FREE_AREA_TAG) { //Slot has never been used - pick a random tag
+            ExcludeMask excludedTags = 0;
+            if (slot > 0) { //Exclude active tag of slot before us, if we're not the first
+                excludedTags = excludeMaskAddTag(excludedTags, GET_TAG_FOR_SLOT(metadata->slot_tags, slot-1));
+            }
+            if (slot < (NUM_SLOT_TAGS - 1)) { //Exclude active tag of slot after us, if we're not last 
+                excludedTags = excludeMaskAddTag(excludedTags, GET_TAG_FOR_SLOT(metadata->slot_tags, slot+1));
+            }
+
+            p = pointerSetRandomTag(p, excludedTags);
+        } else {
+            //!TODO: could ADDG be used here?
+            uint8_t tag = GET_TAG_FOR_SLOT(metadata->slot_tags, slot);
+            uint8_t prev_slot_tag = (slot > 0) ? GET_TAG_FOR_SLOT(metadata->slot_tags, slot-1) : FREE_AREA_TAG;
+            uint8_t next_slot_tag = (slot < (NUM_SLOT_TAGS - 1)) ? GET_TAG_FOR_SLOT(metadata->slot_tags, slot+1) : FREE_AREA_TAG;
+            do {
+                tag = (tag + 1) % MAX_TAG;
+            } while (tag == FREE_AREA_TAG || tag == prev_slot_tag || tag == next_slot_tag);
+
+            p = pointerSetTag(p, tag);
+        }
+        
+        SET_TAG_FOR_SLOT(metadata->slot_tags, slot, pointerGetTag(p));
+#endif
 
         mutex_unlock(&c->lock);
         return p;
@@ -690,13 +807,30 @@ static inline void deallocate_small(void *p, const size_t *expected_size) {
         fatal_error("double free");
     }
 
+#if MTE_HEAP_TAGGING
+    if (unlikely(pointerGetTag(p) != GET_TAG_FOR_SLOT(metadata->slot_tags, slot))) {
+        fatal_error("invalid pointer tag");
+    }
+#endif
+
     if (likely(!is_zero_size)) {
         check_canary(metadata, p, size);
 
         if (ZERO_ON_FREE) {
+#if !MTE_HEAP_TAGGING
             memset(p, 0, size - canary_size);
+#else
+            //It's OK to use size because canaries are not allowed
+            memoryTagAndZero(pointerSetTag(p, FREE_AREA_TAG), size);
+        } else {
+            memoryTag(pointerSetTag(p, FREE_AREA_TAG), size);
         }
+#endif
     }
+
+#if MTE_HEAP_TAGGING
+    SET_TAG_FOR_SLOT(metadata->slot_tags, slot, FREE_AREA_TAG);
+#endif
 
 #if SLAB_QUARANTINE
     if (unlikely(is_quarantine_slot(metadata, slot))) {
@@ -793,6 +927,9 @@ struct region_metadata {
     void *p;
     size_t size;
     size_t guard_size;
+#if MTE_HEAP_TAGGING
+    size_t tag; //Use size_t for alignment
+#endif
 };
 
 struct quarantine_info {
@@ -1152,6 +1289,16 @@ COLD static void init_slow_path(void) {
         }
     }
 
+#if MTE_HEAP_TAGGING
+    for (uint64_t reg_tbl_idx = 0; reg_tbl_idx < (sizeof(ro.regions)/sizeof(ro.regions[0])); reg_tbl_idx++) {
+        for (uint64_t region_idx = 0; region_idx < MAX_REGION_TABLE_SIZE; region_idx++) {
+            region_metadata const* const region = ro.regions[reg_tbl_idx][region_idx];
+            region->tag = FREE_AREA_TAG;
+            memoryTag(pointerSetTag(region->p, FREE_AREA_TAG), region->size);
+        }
+    }
+#endif
+
     deallocate_pages(rng, sizeof(struct random_state), PAGE_SIZE);
 
     atomic_store_explicit(&ro.slab_region_end, slab_region_end, memory_order_release);
@@ -1176,6 +1323,23 @@ static inline unsigned init(void) {
         return arena;
     }
     thread_arena = arena = thread_arena_counter++ % N_ARENA;
+#endif
+
+#if MTE_HEAP_TAGGING
+__attribute__((tls_model("initial-exec"))) //Is this needed?
+static _Thread_local bool mte_prctl_initialized = false;
+
+    if (unlikely(!mte_prctl_initialized)) {
+        /**
+          * Enable tagged address ABI for the current thread, with MTE faults reported synchronously
+          * (best security, but slower) and the free slot tag banned from random tag generation.
+          */
+        if (unlikely(
+            prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | (~(1 << FREE_AREA_TAG) << PR_MTE_TAG_SHIFT), 0, 0, 0)
+        )) {
+            fatal_error("prctl(PR_SET_TAGGED_ADDR_CTRL) failed");
+        }
+    }
 #endif
     if (unlikely(!is_init())) {
         init_slow_path();
@@ -1235,6 +1399,15 @@ static void *allocate_large(size_t size) {
         return NULL;
     }
     stats_large_allocate(ra, size);
+
+#if MTE_HEAP_TAGGING
+    struct region_metadata* region = regions_find(p); //Maybe we could make that not needed?
+
+    p = pointerSetRandomTag(p, 0);
+    memoryTag(p, size);
+    region->tag = pointerGetTag(p);
+#endif
+
     mutex_unlock(&ra->lock);
 
     return p;

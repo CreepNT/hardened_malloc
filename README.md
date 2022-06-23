@@ -271,6 +271,13 @@ The following boolean configuration options are available:
   hardware, which may become drastically lower in the future. Whether or not
   this feature is enabled, the metadata is all contained within an isolated
   memory region with high entropy random guard regions around it.
+* `CONFIG_MTE_HEAP_TAGGING`: `true` or `false` (default) to control whether
+  ARM *Memory Tagging Extensions* will be used to tag allocations.
+  **MTE must be supported on target.**
+* `CONFIG_TIGHTLY_PACK_TAG_ARRAY`: `true` or `false` (default) - requires
+  `CONFIG_MTE_HEAP_TAGGING`, and controls whether the additional metadata
+  required is stored in a tightly packed array (slower, but wastes less space)
+  or in a loosely packed array (faster, but wastes more space).
 
 The following integer configuration options are available:
 
